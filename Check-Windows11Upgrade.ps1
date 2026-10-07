@@ -8,7 +8,7 @@
     Vérifie si la machine est prête pour une mise à niveau vers Windows 11 25H2.
 
     Contrôles principaux :
-      - Version Windows actuelle
+      - Version Windows actuelle (25H2 ou plus récent = déjà à jour, LTSC)
       - Prérequis Microsoft Windows 11 via HardwareReadiness.ps1
       - CPU / RAM / TPM 2.0 / Secure Boot / stockage
       - DirectX 12 / WDDM 2.0
@@ -17,11 +17,12 @@
       - Service Windows Update
       - GPO TargetReleaseVersion / ProductVersion
       - WSUS
-      - Safeguard Hold Microsoft
+      - Safeguard Hold Microsoft (Appraiser, clé GE25H2)
       - Nettoyage automatique du dossier temporaire
 
     Le script HardwareReadiness.ps1 de Microsoft n'est exécuté que si sa
-    signature Authenticode est valide et émise pour Microsoft Corporation.
+    signature Authenticode est valide et émise pour Microsoft Corporation, ou
+    si son empreinte SHA-256 correspond à une version officielle connue.
 
     Lancé depuis un hôte PowerShell 32 bits sur un Windows 64 bits (Intune
     par défaut), le script se relance automatiquement en PowerShell 64 bits
@@ -56,7 +57,7 @@
       1 = NOT_CAPABLE
       2 = UNDETERMINED / ALREADY_CURRENT_CHECK_INCOMPLETE / ERROR
           (y compris exécution sans droits administrateur)
-      3 = CAPABLE_BUT_BLOCKED (GPO / Safeguard Hold)
+      3 = CAPABLE_BUT_BLOCKED (GPO / Safeguard Hold / édition LTSC)
       4 = ALREADY_CURRENT_NOT_COMPLIANT
 #>
 
@@ -73,6 +74,14 @@ $ProgressPreference = "SilentlyContinue"
 $ScriptVersion = "1.2.0"
 $TargetVersion = "25H2"
 $TargetBuild = 26200
+$TargetIndicatorKey = "GE25H2"
+
+# Empreintes SHA-256 de versions officielles connues de HardwareReadiness.ps1
+# (version signée le 2021-11-29), acceptées si la chaîne de certificats ne
+# peut pas être validée localement.
+$KnownHardwareScriptHashes = @(
+    "3F21C32818BFC3A20293317FF91A62ADB349B5A0D468A6DDDEA752F68365C24A"
+)
 $ExitCode = 2
 $FinalResult = "UNDETERMINED"
 
@@ -302,80 +311,106 @@ function Get-GraphicsReadiness {
     }
 }
 
+function ConvertTo-ReleaseNumber {
+    param([string]$Release)
+
+    # "25H2" -> 252 : permet de comparer deux versions Windows "YYHn".
+    if ($Release.Trim() -match '^(\d{2})H([12])$') {
+        return ([int]$Matches[1] * 10) + [int]$Matches[2]
+    }
+
+    return $null
+}
+
+function ConvertTo-StringList {
+    param($Value)
+
+    # Valeurs REG_MULTI_SZ de l'Appraiser : "None" signifie liste vide.
+    @(@($Value) | ForEach-Object { ([string]$_).Trim() } | Where-Object {
+        (-not [string]::IsNullOrWhiteSpace($_)) -and ($_ -ne "None")
+    })
+}
+
+function ConvertTo-NullableInt {
+    param($Value)
+
+    # Attention : "" -as [int] vaut 0, d'où le contrôle explicite.
+    $Text = ([string]$Value).Trim()
+
+    if ($Text -match '^-?\d+$') {
+        return [int]$Text
+    }
+
+    return $null
+}
+
 function Get-SafeguardStatus {
     param(
-        [string]$TargetVersion
+        [string]$IndicatorKeyName
     )
 
     $Known = $false
-    $Hold = $false
+    $GStatus = $null
     $BlockIDs = @()
     $Reasons = @()
     $FailedPrereqs = @()
+    $UpgEx = ""
+    $RedReasons = @()
+    $EvaluatedOn = $null
+    $GWXStatus = $null
 
-    $BaseKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\TargetVersionUpgradeExperienceIndicators"
+    # Seule la sous-clé de la version cible fait foi (GE25H2 pour 25H2) : les
+    # autres sous-clés peuvent conserver d'anciens blocages sur d'autres versions.
+    $IndicatorKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\TargetVersionUpgradeExperienceIndicators\{0}" -f $IndicatorKeyName
+    $Values = Get-ItemProperty -Path $IndicatorKey -ErrorAction SilentlyContinue
 
-    if (Test-Path $BaseKey) {
-        $Keys = Get-ChildItem -Path $BaseKey -ErrorAction SilentlyContinue | Where-Object {
-            $_.PSChildName -like ("*{0}*" -f $TargetVersion)
+    if ($null -ne $Values) {
+        $Known = $true
+        $GStatus = ConvertTo-NullableInt (Get-PropertyValue $Values "GStatus")
+        $BlockIDs = @(ConvertTo-StringList (Get-PropertyValue $Values "GatedBlockId"))
+        $Reasons = @(ConvertTo-StringList (Get-PropertyValue $Values "GatedBlockReason"))
+        $FailedPrereqs = @(ConvertTo-StringList (Get-PropertyValue $Values "FailedPrereqs"))
+        $UpgEx = ([string](Get-PropertyValue $Values "UpgEx" "")).Trim()
+        $RedReasons = @(ConvertTo-StringList (Get-PropertyValue $Values "RedReason"))
+
+        # Date de la dernière évaluation (format non documenté : contrôle de plage).
+        $EpochSeconds = 0L
+        $Timestamp = 0L
+
+        if ([long]::TryParse(([string](Get-PropertyValue $Values "TimestampEpochString" "")).Trim(), [ref]$EpochSeconds) -and ($EpochSeconds -gt 0)) {
+            if ($EpochSeconds -gt 100000000000) {
+                $EpochSeconds = [long]($EpochSeconds / 1000)
+            }
+
+            $EvaluatedOn = (New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc)).AddSeconds($EpochSeconds)
+        }
+        elseif ([long]::TryParse([string](Get-PropertyValue $Values "Timestamp" ""), [ref]$Timestamp) -and ($Timestamp -gt 100000000000000000)) {
+            $EvaluatedOn = [DateTime]::FromFileTimeUtc($Timestamp)
         }
 
-        foreach ($Key in $Keys) {
-            try {
-                $Values = Get-ItemProperty -Path $Key.PSPath -ErrorAction Stop
-                $GStatus = Get-PropertyValue $Values "GStatus"
-
-                if ($null -ne $GStatus) {
-                    $Known = $true
-                    if ([string]$GStatus -eq "0") {
-                        $Hold = $true
-                    }
-                }
-
-                $GatedBlockId = Get-PropertyValue $Values "GatedBlockId"
-                if (($null -ne $GatedBlockId) -and ([string]$GatedBlockId -ne "None")) {
-                    $BlockIDs += @($GatedBlockId)
-                }
-
-                $GatedBlockReason = Get-PropertyValue $Values "GatedBlockReason"
-                if (($null -ne $GatedBlockReason) -and ([string]$GatedBlockReason -ne "None")) {
-                    $Reasons += @($GatedBlockReason)
-                }
-
-                $Failed = Get-PropertyValue $Values "FailedPrereqs"
-                if (($null -ne $Failed) -and ([string]$Failed -ne "None")) {
-                    $FailedPrereqs += @($Failed)
-                }
-            }
-            catch {
-            }
+        if (($null -ne $EvaluatedOn) -and (($EvaluatedOn.Year -lt 2015) -or ($EvaluatedOn -gt [DateTime]::UtcNow.AddDays(1)))) {
+            $EvaluatedOn = $null
         }
     }
 
-    $GWXKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Appraiser\GWX"
+    # Appraiser\GWX n'est pas propre à une version cible : simple indice,
+    # utilisé uniquement en l'absence de la sous-clé de la version cible.
+    $GWX = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Appraiser\GWX" -ErrorAction SilentlyContinue
 
-    if (Test-Path $GWXKey) {
-        try {
-            $GWX = Get-ItemProperty $GWXKey -ErrorAction Stop
-            $GWXStatus = Get-PropertyValue $GWX "GStatus"
-
-            if ($null -ne $GWXStatus) {
-                $Known = $true
-                if ([string]$GWXStatus -eq "0") {
-                    $Hold = $true
-                }
-            }
-        }
-        catch {
-        }
+    if ($null -ne $GWX) {
+        $GWXStatus = ConvertTo-NullableInt (Get-PropertyValue $GWX "GStatus")
     }
 
     [PSCustomObject]@{
         Known         = $Known
-        Hold          = $Hold
+        GStatus       = $GStatus
         BlockIDs      = $BlockIDs
         Reasons       = $Reasons
         FailedPrereqs = $FailedPrereqs
+        UpgEx         = $UpgEx
+        RedReasons    = $RedReasons
+        EvaluatedOn   = $EvaluatedOn
+        GWXStatus     = $GWXStatus
     }
 }
 
@@ -391,10 +426,14 @@ if (-not [string]::IsNullOrWhiteSpace($HardwareScriptPath)) {
     $HardwareScriptPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($HardwareScriptPath)
 }
 
-if ([Environment]::Is64BitOperatingSystem -and (-not [Environment]::Is64BitProcess)) {
+$Is32BitHostOn64BitOS = [Environment]::Is64BitOperatingSystem -and (-not [Environment]::Is64BitProcess)
+
+if ($Is32BitHostOn64BitOS) {
     $SysNativePowerShell = Join-Path $env:SystemRoot "SysNative\WindowsPowerShell\v1.0\powershell.exe"
 
-    if ((-not [string]::IsNullOrEmpty($PSCommandPath)) -and (Test-Path $SysNativePowerShell)) {
+    # La variable d'environnement empêche une relance en boucle (ex. Windows
+    # ARM64 dont le PowerShell natif ne serait pas 64 bits).
+    if ((-not [string]::IsNullOrEmpty($PSCommandPath)) -and (Test-Path $SysNativePowerShell) -and ($env:KISSLABS_W11CHECK_RELAUNCHED -ne "1")) {
         $RelaunchArguments = @(
             "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
             "-File", $PSCommandPath,
@@ -413,9 +452,15 @@ if ([Environment]::Is64BitOperatingSystem -and (-not [Environment]::Is64BitProce
 
         # La sortie d'erreur du processus enfant ne doit pas interrompre le relais.
         $ErrorActionPreference = "Continue"
+        $env:KISSLABS_W11CHECK_RELAUNCHED = "1"
 
         try {
             & $SysNativePowerShell @RelaunchArguments
+
+            if ($null -eq $LASTEXITCODE) {
+                exit 2
+            }
+
             exit $LASTEXITCODE
         }
         catch {
@@ -476,6 +521,7 @@ try {
     $ProductName = [string](Get-PropertyValue $CurrentVersion "ProductName" "Windows")
     $DisplayVersion = [string](Get-PropertyValue $CurrentVersion "DisplayVersion" (Get-PropertyValue $CurrentVersion "ReleaseId" "Unknown"))
     $EditionID = [string](Get-PropertyValue $CurrentVersion "EditionID" "Unknown")
+    $IsLTSC = ($EditionID -like "*EnterpriseS*")
     $Build = [int](Get-PropertyValue $CurrentVersion "CurrentBuildNumber" 0)
     $UBR = [int](Get-PropertyValue $CurrentVersion "UBR" 0)
     $FullBuild = "{0}.{1}" -f $Build, $UBR
@@ -527,7 +573,7 @@ try {
         if ($Build -lt 19041) {
             $OSBlockers.Add("Windows 10 version 2004 ou supérieure requise.")
         }
-        elseif (($Build -ge 19041) -and ($Build -le 19043) -and ($UBR -lt 1237)) {
+        elseif (($Build -ge 19041) -and ($Build -le 19045) -and ($UBR -lt 1237)) {
             $OSBlockers.Add("La mise à jour de sécurité du 14 septembre 2021 ou une version ultérieure est requise.")
         }
     }
@@ -542,8 +588,11 @@ try {
     }
 
     # Comparaison sur le build et non sur DisplayVersion : une version plus
-    # récente que la cible (ex. 26H1) doit aussi être considérée comme à jour.
+    # récente que la cible (26H2, 26H1...) doit aussi être considérée comme à jour.
     $AlreadyTarget = $IsWindows11 -and ($Build -ge $TargetBuild)
+
+    # Les éditions LTSC ne reçoivent pas de mise à jour de fonctionnalités.
+    $EditionBlock = $IsLTSC -and $IsClientOS -and (-not $AlreadyTarget)
 
     if ($AlreadyTarget) {
         if ($DisplayVersion -eq $TargetVersion) {
@@ -555,6 +604,10 @@ try {
     }
     else {
         Write-Check "Version cible" "INFO" ("Cible de mise à niveau : Windows 11 {0}" -f $TargetVersion)
+    }
+
+    if ($EditionBlock) {
+        Write-Check "Edition LTSC" "WARN" ("{0} : pas de mise à jour de fonctionnalités vers {1} via Windows Update." -f $EditionID, $TargetVersion)
     }
 
     # ------------------------------------------------------------------------
@@ -606,14 +659,38 @@ try {
         $SignerSubject = [string]$Signature.SignerCertificate.Subject
     }
 
-    if (($Signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) -or ($SignerSubject -notlike "CN=Microsoft Corporation,*")) {
+    $HardwareScriptHash = (Get-FileHash -LiteralPath $HardwareScript -Algorithm SHA256).Hash
+    $SignatureValid = ($Signature.Status -eq [System.Management.Automation.SignatureStatus]::Valid) -and
+        ($SignerSubject -like "CN=Microsoft Corporation, O=Microsoft Corporation,*")
+
+    if ($SignatureValid) {
+        Write-Check "Signature script" "OK" "Signature Microsoft Corporation valide."
+    }
+    elseif ($KnownHardwareScriptHashes -contains $HardwareScriptHash) {
+        Write-Check "Signature script" "WARN" ("Etat Authenticode : {0} ; empreinte identique à la version Microsoft connue." -f $Signature.Status)
+    }
+    else {
         Write-Check "Signature script" "FAIL" ("Etat Authenticode : {0} ; signataire : {1}" -f $Signature.Status, $SignerSubject)
+
+        if (-not [string]::IsNullOrWhiteSpace($Signature.StatusMessage)) {
+            Write-Check "Détail signature" "FAIL" $Signature.StatusMessage
+        }
+
         throw "HardwareReadiness.ps1 n'a pas de signature Microsoft valide : exécution refusée."
     }
 
-    Write-Check "Signature script" "OK" "Signature Microsoft Corporation valide."
+    Write-Check "SHA-256 script" "INFO" $HardwareScriptHash
 
-    $WindowsPowerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $WindowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+
+    # Hôte 32 bits non relancé : passer quand même par le PowerShell 64 bits.
+    if ($Is32BitHostOn64BitOS) {
+        $SysNativeHardwarePowerShell = Join-Path $env:SystemRoot "SysNative\WindowsPowerShell\v1.0\powershell.exe"
+
+        if (Test-Path $SysNativeHardwarePowerShell) {
+            $WindowsPowerShell = $SysNativeHardwarePowerShell
+        }
+    }
 
     if (-not (Test-Path $WindowsPowerShell)) {
         throw "Windows PowerShell 5.1 introuvable."
@@ -626,14 +703,20 @@ try {
     $ErrorActionPreference = "Continue"
 
     try {
-        $RawOutput = @(
-            & $WindowsPowerShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $HardwareScript 2>&1 |
-            ForEach-Object { [string]$_ }
+        $ChildOutput = @(
+            & $WindowsPowerShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $HardwareScript 2>&1
         )
     }
     finally {
         $ErrorActionPreference = $PreviousErrorActionPreference
     }
+
+    # stdout porte le JSON ; stderr ne contient que des erreurs non bloquantes
+    # du script Microsoft (typiquement des échecs WMI).
+    $RawOutput = @($ChildOutput | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
+    $ChildErrors = @($ChildOutput | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { ([string]$_).Trim() } | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    })
 
     $HardwareResult = $null
 
@@ -653,26 +736,48 @@ try {
     if ($null -eq $HardwareResult) {
         Write-Host ""
         Write-Host "Sortie brute HardwareReadiness :" -ForegroundColor Yellow
-        $RawOutput | ForEach-Object { Write-Host $_ }
+        $ChildOutput | ForEach-Object { Write-Host ([string]$_) }
         throw "Impossible d'analyser le résultat JSON HardwareReadiness."
     }
 
     $HardwareLogging = [string](Get-PropertyValue $HardwareResult "logging" "")
 
+    $FailEntries = New-Object System.Collections.Generic.List[string]
+
     # Les ";" entre accolades (détail du processeur) ne séparent pas les entrées.
-    foreach ($Entry in ($HardwareLogging -split ';\s*(?![^{]*\})')) {
+    # Chaque entrée se termine par PASS / FAIL / UNDETERMINED ; les autres
+    # fragments sont le détail d'une exception (texte localisé).
+    foreach ($RawEntry in ($HardwareLogging -split ';\s*(?![^{]*\})')) {
+        $Entry = $RawEntry.Trim()
+
         if ([string]::IsNullOrWhiteSpace($Entry)) {
             continue
         }
 
-        if ($Entry -match '\bFAIL\b') {
+        if ($Entry -cmatch '\bFAIL$') {
+            $FailEntries.Add($Entry)
             Write-Check "Microsoft HW" "FAIL" $Entry
         }
-        elseif ($Entry -match '\bPASS\b') {
+        elseif ($Entry -cmatch '\bUNDETERMINED$') {
+            Write-Check "Microsoft HW" "WARN" $Entry
+        }
+        elseif ($Entry -cmatch '\bPASS$') {
             Write-Check "Microsoft HW" "OK" $Entry
         }
         else {
             Write-Check "Microsoft HW" "INFO" $Entry
+        }
+    }
+
+    if ($ChildErrors.Count -gt 0) {
+        $MaxErrorLines = 10
+
+        foreach ($ErrorLine in ($ChildErrors | Select-Object -First $MaxErrorLines)) {
+            Write-Check "Erreur HW script" "WARN" $ErrorLine
+        }
+
+        if ($ChildErrors.Count -gt $MaxErrorLines) {
+            Write-Check "Erreur HW script" "WARN" ("... {0} ligne(s) supplémentaire(s)." -f ($ChildErrors.Count - $MaxErrorLines))
         }
     }
 
@@ -683,18 +788,40 @@ try {
     $HardwareNotCapable = $false
     $HardwareUndetermined = $false
 
+    $CleanReason = $HWReason.Trim().TrimEnd(",")
+
+    # Un FAIL dû uniquement à une requête WMI en échec ("... is null") ne
+    # prouve pas une incompatibilité matérielle : résultat indéterminé.
+    $WmiOnlyFailure = ($HWReturnCode -eq 1) -and ($ChildErrors.Count -gt 0) -and ($FailEntries.Count -gt 0) -and
+        (@($FailEntries | Where-Object { $_ -notmatch '(is null|=null)\.\s*FAIL$' }).Count -eq 0)
+
     switch ($HWReturnCode) {
         0 {
             Write-Check "Résultat matériel" "OK" "CAPABLE"
+
+            # Le script Microsoft force CAPABLE pour certains modèles (i7-7820HQ).
+            if (-not [string]::IsNullOrWhiteSpace($CleanReason)) {
+                Write-Check "Exception Microsoft" "WARN" ("CAPABLE malgré : {0}" -f $CleanReason)
+            }
         }
 
         1 {
-            $HardwareNotCapable = $true
-            Write-Check "Résultat matériel" "FAIL" "NOT CAPABLE"
+            if ($WmiOnlyFailure) {
+                $HardwareUndetermined = $true
+                Write-Check "Résultat matériel" "WARN" "NOT CAPABLE dû à une erreur WMI : contrôle indéterminé."
+            }
+            else {
+                $HardwareNotCapable = $true
+                Write-Check "Résultat matériel" "FAIL" "NOT CAPABLE"
+            }
 
-            if (-not [string]::IsNullOrWhiteSpace($HWReason)) {
-                $CleanReason = $HWReason.Trim().TrimEnd(",")
-                Write-Check "Blocage matériel" "FAIL" $CleanReason
+            if (-not [string]::IsNullOrWhiteSpace($CleanReason)) {
+                if ($WmiOnlyFailure) {
+                    Write-Check "Blocage matériel" "WARN" $CleanReason
+                }
+                else {
+                    Write-Check "Blocage matériel" "FAIL" $CleanReason
+                }
             }
         }
 
@@ -783,12 +910,18 @@ try {
 
         if ([int]$TargetReleaseEnabled -eq 1) {
             if (-not [string]::IsNullOrWhiteSpace($TargetReleaseInfo)) {
-                if ($TargetReleaseInfo -ne $TargetVersion) {
-                    $PolicyBlock = $true
-                    Write-Check "TargetReleaseVersion" "WARN" ("GPO verrouillée sur {0} ; cible attendue {1}." -f $TargetReleaseInfo, $TargetVersion)
+                $PolicyRelease = ConvertTo-ReleaseNumber $TargetReleaseInfo
+                $ExpectedRelease = ConvertTo-ReleaseNumber $TargetVersion
+
+                if ($TargetReleaseInfo.Trim() -eq $TargetVersion) {
+                    Write-Check "TargetReleaseVersion" "OK" ("GPO autorise {0}." -f $TargetVersion)
+                }
+                elseif (($null -ne $PolicyRelease) -and ($null -ne $ExpectedRelease) -and ($PolicyRelease -gt $ExpectedRelease)) {
+                    Write-Check "TargetReleaseVersion" "INFO" ("GPO cible {0}, plus récent que {1}." -f $TargetReleaseInfo, $TargetVersion)
                 }
                 else {
-                    Write-Check "TargetReleaseVersion" "OK" ("GPO autorise {0}." -f $TargetVersion)
+                    $PolicyBlock = $true
+                    Write-Check "TargetReleaseVersion" "WARN" ("GPO verrouillée sur {0} ; cible attendue {1}." -f $TargetReleaseInfo, $TargetVersion)
                 }
             }
 
@@ -803,6 +936,14 @@ try {
         if ($null -ne $FeatureDeferral) {
             Write-Check "Feature Update Deferral" "INFO" ("{0} jour(s)" -f $FeatureDeferral)
         }
+    }
+
+    # Contournement des safeguard holds par stratégie (GPO ou MDM / Intune).
+    $SafeguardsBypassed = ([string](Get-PropertyValue $WUPolicy "DisableWUfBSafeguards" "")).Trim() -eq "1"
+    $MdmUpdatePolicy = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update" -ErrorAction SilentlyContinue
+
+    if (([string](Get-PropertyValue $MdmUpdatePolicy "DisableWUfBSafeguards" "")).Trim() -eq "1") {
+        $SafeguardsBypassed = $true
     }
 
     # ------------------------------------------------------------------------
@@ -827,28 +968,69 @@ try {
 
     Write-Title "5. MICROSOFT SAFEGUARD HOLD"
 
-    $Safeguard = Get-SafeguardStatus -TargetVersion $TargetVersion
+    $Safeguard = Get-SafeguardStatus -IndicatorKeyName $TargetIndicatorKey
+    $SafeguardHold = $false
+    $SafeguardBlocking = $false
 
     if (-not $Safeguard.Known) {
-        Write-Check "Safeguard Hold" "INFO" ("Aucune donnée Appraiser exploitable pour {0}." -f $TargetVersion)
-    }
-    elseif ($Safeguard.Hold) {
-        Write-Check "Safeguard Hold" "WARN" "Microsoft bloque actuellement l'upgrade sur cette machine."
+        Write-Check "Safeguard Hold" "INFO" ("Aucune évaluation Appraiser pour {0} (clé {1} absente)." -f $TargetVersion, $TargetIndicatorKey)
 
-        if ($Safeguard.BlockIDs.Count -gt 0) {
-            Write-Check "Safeguard ID" "WARN" ($Safeguard.BlockIDs -join ", ")
-        }
-
-        if ($Safeguard.Reasons.Count -gt 0) {
-            Write-Check "Safeguard Reason" "WARN" ($Safeguard.Reasons -join ", ")
-        }
-
-        if ($Safeguard.FailedPrereqs.Count -gt 0) {
-            Write-Check "Failed prerequisites" "WARN" ($Safeguard.FailedPrereqs -join ", ")
+        if ($Safeguard.GWXStatus -eq 0) {
+            Write-Check "Safeguard (GWX)" "WARN" "Indice de safeguard hold non spécifique à la version cible (Appraiser\GWX GStatus=0)."
         }
     }
     else {
-        Write-Check "Safeguard Hold" "OK" "Aucun safeguard hold détecté."
+        if ($Safeguard.BlockIDs.Count -gt 0) {
+            $SafeguardHold = $true
+            Write-Check "Safeguard Hold" "WARN" "Microsoft bloque actuellement l'upgrade sur cette machine."
+            Write-Check "Safeguard ID" "WARN" ($Safeguard.BlockIDs -join ", ")
+
+            if ($Safeguard.Reasons.Count -gt 0) {
+                Write-Check "Safeguard Reason" "WARN" ($Safeguard.Reasons -join ", ")
+            }
+        }
+        elseif ($Safeguard.GStatus -eq 0) {
+            $SafeguardHold = $true
+            Write-Check "Safeguard Hold" "WARN" "Safeguard hold signalé par l'Appraiser (GStatus=0), sans identifiant."
+        }
+        elseif ($Safeguard.GStatus -eq 1) {
+            Write-Check "Safeguard Hold" "WARN" "Avertissement de compatibilité Appraiser (GStatus=1), non bloquant."
+        }
+        elseif ($Safeguard.GStatus -eq 2) {
+            Write-Check "Safeguard Hold" "OK" "Aucun safeguard hold détecté."
+        }
+        else {
+            Write-Check "Safeguard Hold" "INFO" ("Données Appraiser incomplètes pour {0} (GStatus absent)." -f $TargetVersion)
+        }
+
+        # Blocages matériels vus par l'Appraiser : à recouper avec HardwareReadiness.
+        if ($Safeguard.RedReasons.Count -gt 0) {
+            Write-Check "Appraiser" "INFO" ("Blocage matériel signalé ({0}) : {1}" -f $Safeguard.UpgEx, ($Safeguard.RedReasons -join ", "))
+        }
+
+        if ($Safeguard.FailedPrereqs.Count -gt 0) {
+            Write-Check "Appraiser" "INFO" ("Evaluation incomplète : {0}" -f ($Safeguard.FailedPrereqs -join ", "))
+        }
+
+        if ($null -ne $Safeguard.EvaluatedOn) {
+            $AppraiserAgeDays = [Math]::Floor(([DateTime]::UtcNow - $Safeguard.EvaluatedOn).TotalDays)
+
+            if ($AppraiserAgeDays -gt 30) {
+                Write-Check "Evaluation Appraiser" "WARN" ("{0:yyyy-MM-dd} ({1} jours) : données potentiellement obsolètes." -f $Safeguard.EvaluatedOn.ToLocalTime(), $AppraiserAgeDays)
+            }
+            else {
+                Write-Check "Evaluation Appraiser" "INFO" ("{0:yyyy-MM-dd} ({1} jour(s))" -f $Safeguard.EvaluatedOn.ToLocalTime(), $AppraiserAgeDays)
+            }
+        }
+    }
+
+    if ($SafeguardHold) {
+        if ($SafeguardsBypassed) {
+            Write-Check "DisableWUfBSafeguards" "WARN" "Stratégie active : les safeguard holds sont ignorés sur cette machine."
+        }
+        else {
+            $SafeguardBlocking = $true
+        }
     }
 
     # ------------------------------------------------------------------------
@@ -946,12 +1128,24 @@ try {
 
         $ExitCode = 2
     }
-    elseif ($Safeguard.Hold -or $PolicyBlock) {
+    elseif ($SafeguardBlocking -or $PolicyBlock -or $EditionBlock) {
         $FinalResult = "CAPABLE_BUT_BLOCKED"
 
         Write-Host ""
         Write-Host ("UPGRADE WINDOWS 11 {0} : CAPABLE MAIS BLOQUE" -f $TargetVersion) -ForegroundColor Yellow
-        Write-Host "Le matériel est compatible, mais Windows Update / une GPO / un Safeguard Hold empêche actuellement le déploiement." -ForegroundColor Yellow
+        Write-Host "Le matériel est compatible, mais le déploiement est actuellement bloqué :" -ForegroundColor Yellow
+
+        if ($SafeguardBlocking) {
+            Write-Host "- Safeguard Hold Microsoft." -ForegroundColor Yellow
+        }
+
+        if ($PolicyBlock) {
+            Write-Host "- GPO Windows Update (TargetReleaseVersion / ProductVersion)." -ForegroundColor Yellow
+        }
+
+        if ($EditionBlock) {
+            Write-Host ("- Edition LTSC ({0}) : pas de mise à jour de fonctionnalités." -f $EditionID) -ForegroundColor Yellow
+        }
 
         $ExitCode = 3
     }
