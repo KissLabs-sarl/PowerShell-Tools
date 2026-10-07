@@ -20,29 +20,59 @@
       - Safeguard Hold Microsoft
       - Nettoyage automatique du dossier temporaire
 
-.EXITCODES
-    0 = READY / ALREADY_CURRENT
-    1 = NOT_CAPABLE
-    2 = UNDETERMINED / erreur de contrôle
-    3 = CAPABLE_BUT_BLOCKED (GPO / Safeguard Hold)
-    4 = ALREADY_CURRENT_NOT_COMPLIANT
+    Le script HardwareReadiness.ps1 de Microsoft n'est exécuté que si sa
+    signature Authenticode est valide et émise pour Microsoft Corporation.
+
+    Lancé depuis un hôte PowerShell 32 bits sur un Windows 64 bits (Intune
+    par défaut), le script se relance automatiquement en PowerShell 64 bits
+    afin de lire les bonnes clés de registre.
+
+.PARAMETER RecommendedFreeSpaceGB
+    Espace libre recommandé sur le disque système, en Go. En dessous, un
+    avertissement est affiché (non bloquant). Défaut : 30.
+
+.PARAMETER KeepTemp
+    Conserve le dossier temporaire (HardwareReadiness.ps1, DxDiag.xml) pour
+    analyse au lieu de le supprimer en fin d'exécution.
+
+.PARAMETER HardwareScriptPath
+    Chemin d'une copie locale de HardwareReadiness.ps1, pour les machines sans
+    accès Internet. Si absent, le script est téléchargé depuis
+    https://aka.ms/HWReadinessScript. La signature est contrôlée dans les deux cas.
+
+.EXAMPLE
+    .\Check-Windows11Upgrade.ps1
+
+.EXAMPLE
+    .\Check-Windows11Upgrade.ps1 -HardwareScriptPath "\\serveur\partage\HardwareReadiness.ps1" -KeepTemp
 
 .NOTES
-    Cible de déploiement : Windows 11 25H2
-    Compatible Windows PowerShell 5.1
+    Version              : 1.2.0
+    Cible de déploiement : Windows 11 25H2 (build 26200)
+    Compatible Windows PowerShell 5.1, droits administrateur requis.
+
+    Codes de sortie :
+      0 = READY / ALREADY_CURRENT
+      1 = NOT_CAPABLE
+      2 = UNDETERMINED / ALREADY_CURRENT_CHECK_INCOMPLETE / ERROR
+          (y compris exécution sans droits administrateur)
+      3 = CAPABLE_BUT_BLOCKED (GPO / Safeguard Hold)
+      4 = ALREADY_CURRENT_NOT_COMPLIANT
 #>
 
 [CmdletBinding()]
 param(
     [int]$RecommendedFreeSpaceGB = 30,
-    [switch]$KeepTemp
+    [switch]$KeepTemp,
+    [string]$HardwareScriptPath
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$ScriptVersion = "1.1.0"
+$ScriptVersion = "1.2.0"
 $TargetVersion = "25H2"
+$TargetBuild = 26200
 $ExitCode = 2
 $FinalResult = "UNDETERMINED"
 
@@ -350,6 +380,55 @@ function Get-SafeguardStatus {
 }
 
 # ----------------------------------------------------------------------------
+# Relance en PowerShell 64 bits
+# ----------------------------------------------------------------------------
+
+# Un hôte 32 bits (Intune par défaut, certains RMM) voit le registre via
+# WOW6432Node : les clés Appraiser / Component Based Servicing seraient
+# introuvables et les contrôles concluraient à tort que tout va bien.
+if (-not [string]::IsNullOrWhiteSpace($HardwareScriptPath)) {
+    # Chemin absolu : le processus relancé ne partage pas l'emplacement PowerShell courant.
+    $HardwareScriptPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($HardwareScriptPath)
+}
+
+if ([Environment]::Is64BitOperatingSystem -and (-not [Environment]::Is64BitProcess)) {
+    $SysNativePowerShell = Join-Path $env:SystemRoot "SysNative\WindowsPowerShell\v1.0\powershell.exe"
+
+    if ((-not [string]::IsNullOrEmpty($PSCommandPath)) -and (Test-Path $SysNativePowerShell)) {
+        $RelaunchArguments = @(
+            "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", $PSCommandPath,
+            "-RecommendedFreeSpaceGB", $RecommendedFreeSpaceGB
+        )
+
+        if ($KeepTemp) {
+            $RelaunchArguments += "-KeepTemp"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($HardwareScriptPath)) {
+            $RelaunchArguments += @("-HardwareScriptPath", $HardwareScriptPath)
+        }
+
+        Write-Host "[INFO] Hôte PowerShell 32 bits détecté : relance en PowerShell 64 bits." -ForegroundColor Cyan
+
+        # La sortie d'erreur du processus enfant ne doit pas interrompre le relais.
+        $ErrorActionPreference = "Continue"
+
+        try {
+            & $SysNativePowerShell @RelaunchArguments
+            exit $LASTEXITCODE
+        }
+        catch {
+            Write-Host ("[WARN] Relance 64 bits impossible : {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+        }
+
+        $ErrorActionPreference = "Stop"
+    }
+
+    Write-Host "[WARN] Hôte PowerShell 32 bits : certains contrôles du registre peuvent être incomplets." -ForegroundColor Yellow
+}
+
+# ----------------------------------------------------------------------------
 # Vérification des droits administrateur
 # ----------------------------------------------------------------------------
 
@@ -400,10 +479,12 @@ try {
     $Build = [int](Get-PropertyValue $CurrentVersion "CurrentBuildNumber" 0)
     $UBR = [int](Get-PropertyValue $CurrentVersion "UBR" 0)
     $FullBuild = "{0}.{1}" -f $Build, $UBR
-    $IsWindows11 = ($Build -ge 22000)
+    $IsClientOS = ($OS.ProductType -eq 1)
+    $IsWindows11 = $IsClientOS -and ($Build -ge 22000)
 
     # Le registre peut encore exposer "Windows 10" sur certaines installations
-    # Windows 11. Le numéro de build reste la référence la plus fiable ici.
+    # Windows 11. Le numéro de build reste la référence la plus fiable ici
+    # (Windows Server 2025 partage toutefois le build 26100 : d'où ProductType).
     if ($IsWindows11) {
         $FriendlyProductName = "Windows 11"
     }
@@ -438,7 +519,7 @@ try {
 
     $OSBlockers = New-Object System.Collections.Generic.List[string]
 
-    if ($OS.ProductType -ne 1) {
+    if (-not $IsClientOS) {
         $OSBlockers.Add("Windows Server détecté : ce contrôle concerne Windows Client.")
     }
 
@@ -460,10 +541,17 @@ try {
         }
     }
 
-    $AlreadyTarget = ($DisplayVersion -eq $TargetVersion)
+    # Comparaison sur le build et non sur DisplayVersion : une version plus
+    # récente que la cible (ex. 26H1) doit aussi être considérée comme à jour.
+    $AlreadyTarget = $IsWindows11 -and ($Build -ge $TargetBuild)
 
     if ($AlreadyTarget) {
-        Write-Check "Version cible" "OK" ("Windows 11 {0} est déjà installé." -f $TargetVersion)
+        if ($DisplayVersion -eq $TargetVersion) {
+            Write-Check "Version cible" "OK" ("Windows 11 {0} est déjà installé." -f $TargetVersion)
+        }
+        else {
+            Write-Check "Version cible" "OK" ("Windows 11 {0} (build {1}) installé : plus récent que la cible {2}." -f $DisplayVersion, $Build, $TargetVersion)
+        }
     }
     else {
         Write-Check "Version cible" "INFO" ("Cible de mise à niveau : Windows 11 {0}" -f $TargetVersion)
@@ -494,22 +582,36 @@ try {
 
     Write-Title "2. MICROSOFT WINDOWS 11 HARDWARE READINESS"
 
-    $Url = "https://aka.ms/HWReadinessScript"
-    Invoke-RobustDownload -Uri $Url -Destination $HardwareScript
+    if ([string]::IsNullOrWhiteSpace($HardwareScriptPath)) {
+        $Url = "https://aka.ms/HWReadinessScript"
+        Invoke-RobustDownload -Uri $Url -Destination $HardwareScript
 
-    Write-Check "HardwareReadiness.ps1" "OK" "Script Microsoft téléchargé."
-
-    $Signature = Get-AuthenticodeSignature -FilePath $HardwareScript
-
-    if (($Signature.Status -eq "Valid") -and ($null -ne $Signature.SignerCertificate) -and ($Signature.SignerCertificate.Subject -match "Microsoft")) {
-        Write-Check "Signature script" "OK" "Signature Microsoft valide."
-    }
-    elseif ($Signature.Status -eq "NotSigned") {
-        Write-Check "Signature script" "WARN" "Script non signé ; source HTTPS officielle aka.ms utilisée."
+        Write-Check "HardwareReadiness.ps1" "OK" "Script Microsoft téléchargé."
     }
     else {
-        Write-Check "Signature script" "WARN" ("Etat Authenticode : {0}" -f $Signature.Status)
+        if (-not (Test-Path -LiteralPath $HardwareScriptPath -PathType Leaf)) {
+            throw ("Copie locale de HardwareReadiness.ps1 introuvable : {0}" -f $HardwareScriptPath)
+        }
+
+        # Copie dans le dossier temporaire : le fichier contrôlé est celui exécuté.
+        Copy-Item -LiteralPath $HardwareScriptPath -Destination $HardwareScript -Force
+        Write-Check "HardwareReadiness.ps1" "OK" ("Copie locale utilisée : {0}" -f $HardwareScriptPath)
     }
+
+    # Le script est exécuté en administrateur : il doit être signé par Microsoft.
+    $Signature = Get-AuthenticodeSignature -FilePath $HardwareScript
+    $SignerSubject = ""
+
+    if ($null -ne $Signature.SignerCertificate) {
+        $SignerSubject = [string]$Signature.SignerCertificate.Subject
+    }
+
+    if (($Signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) -or ($SignerSubject -notlike "CN=Microsoft Corporation,*")) {
+        Write-Check "Signature script" "FAIL" ("Etat Authenticode : {0} ; signataire : {1}" -f $Signature.Status, $SignerSubject)
+        throw "HardwareReadiness.ps1 n'a pas de signature Microsoft valide : exécution refusée."
+    }
+
+    Write-Check "Signature script" "OK" "Signature Microsoft Corporation valide."
 
     $WindowsPowerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 
@@ -517,10 +619,21 @@ try {
         throw "Windows PowerShell 5.1 introuvable."
     }
 
-    $RawOutput = @(
-        & $WindowsPowerShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $HardwareScript 2>&1 |
-        ForEach-Object { [string]$_ }
-    )
+    # Sous Windows PowerShell 5.1, avec ErrorActionPreference = Stop, la
+    # première ligne écrite sur stderr par le processus enfant deviendrait une
+    # erreur bloquante : elle doit au contraire être lue comme le reste.
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
+    try {
+        $RawOutput = @(
+            & $WindowsPowerShell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $HardwareScript 2>&1 |
+            ForEach-Object { [string]$_ }
+        )
+    }
+    finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
 
     $HardwareResult = $null
 
@@ -546,7 +659,8 @@ try {
 
     $HardwareLogging = [string](Get-PropertyValue $HardwareResult "logging" "")
 
-    foreach ($Entry in ($HardwareLogging -split ';\s*')) {
+    # Les ";" entre accolades (détail du processeur) ne séparent pas les entrées.
+    foreach ($Entry in ($HardwareLogging -split ';\s*(?![^{]*\})')) {
         if ([string]::IsNullOrWhiteSpace($Entry)) {
             continue
         }
@@ -566,16 +680,16 @@ try {
     $HWReturnResult = [string](Get-PropertyValue $HardwareResult "returnResult" "UNKNOWN")
     $HWReason = [string](Get-PropertyValue $HardwareResult "returnReason" "")
 
-    $HardwareCapable = $false
+    $HardwareNotCapable = $false
     $HardwareUndetermined = $false
 
     switch ($HWReturnCode) {
         0 {
-            $HardwareCapable = $true
             Write-Check "Résultat matériel" "OK" "CAPABLE"
         }
 
         1 {
+            $HardwareNotCapable = $true
             Write-Check "Résultat matériel" "FAIL" "NOT CAPABLE"
 
             if (-not [string]::IsNullOrWhiteSpace($HWReason)) {
@@ -746,26 +860,18 @@ try {
     # Le script Microsoft reste l'autorité principale pour CPU / RAM / TPM /
     # Secure Boot / stockage. Le GPU devient bloquant uniquement sur une
     # machine physique. Sur une VM, un GPU virtuel insuffisant est un WARN.
-    $PermanentBlock = ($OSBlockers.Count -gt 0) -or (-not $HardwareCapable) -or $GraphicsBlocking
+    # Un blocage avéré l'emporte sur un contrôle matériel indéterminé.
+    $PermanentBlock = ($OSBlockers.Count -gt 0) -or $HardwareNotCapable -or $GraphicsBlocking
 
     if ($AlreadyTarget) {
-        if ($HardwareUndetermined) {
-            $FinalResult = "ALREADY_CURRENT_CHECK_INCOMPLETE"
-
-            Write-Host ""
-            Write-Host ("WINDOWS 11 {0} EST DEJA INSTALLE" -f $TargetVersion) -ForegroundColor Green
-            Write-Host "Le contrôle matériel Microsoft n'a pas pu être déterminé complètement." -ForegroundColor Yellow
-
-            $ExitCode = 2
-        }
-        elseif ($PermanentBlock) {
+        if ($PermanentBlock) {
             $FinalResult = "ALREADY_CURRENT_NOT_COMPLIANT"
 
             Write-Host ""
-            Write-Host ("WINDOWS 11 {0} EST DEJA INSTALLE" -f $TargetVersion) -ForegroundColor Green
+            Write-Host ("WINDOWS 11 {0} EST DEJA INSTALLE" -f $DisplayVersion) -ForegroundColor Green
             Write-Host "ATTENTION : la configuration matérielle actuelle ne respecte pas tous les prérequis contrôlés pour Windows 11." -ForegroundColor Yellow
 
-            if (-not $HardwareCapable) {
+            if ($HardwareNotCapable) {
                 Write-Host "Le contrôle Microsoft HardwareReadiness retourne NOT CAPABLE." -ForegroundColor Red
             }
 
@@ -773,13 +879,26 @@ try {
                 Write-Host "Le contrôle DirectX / WDDM est bloquant sur cette machine physique." -ForegroundColor Red
             }
 
+            if ($HardwareUndetermined) {
+                Write-Host "Le contrôle matériel Microsoft n'a pas pu être déterminé complètement." -ForegroundColor Yellow
+            }
+
             $ExitCode = 4
+        }
+        elseif ($HardwareUndetermined) {
+            $FinalResult = "ALREADY_CURRENT_CHECK_INCOMPLETE"
+
+            Write-Host ""
+            Write-Host ("WINDOWS 11 {0} EST DEJA INSTALLE" -f $DisplayVersion) -ForegroundColor Green
+            Write-Host "Le contrôle matériel Microsoft n'a pas pu être déterminé complètement." -ForegroundColor Yellow
+
+            $ExitCode = 2
         }
         else {
             $FinalResult = "ALREADY_CURRENT"
 
             Write-Host ""
-            Write-Host ("WINDOWS 11 {0} EST DEJA INSTALLE" -f $TargetVersion) -ForegroundColor Green
+            Write-Host ("WINDOWS 11 {0} EST DEJA INSTALLE" -f $DisplayVersion) -ForegroundColor Green
             Write-Host "Les prérequis matériels principaux contrôlés sont conformes." -ForegroundColor Green
 
             if ($VirtualGraphicsWarning) {
@@ -793,6 +912,31 @@ try {
             $ExitCode = 0
         }
     }
+    elseif ($PermanentBlock) {
+        $FinalResult = "NOT_CAPABLE"
+
+        Write-Host ""
+        Write-Host ("UPGRADE WINDOWS 11 {0} : NOT CAPABLE" -f $TargetVersion) -ForegroundColor Red
+        Write-Host "Au moins un prérequis obligatoire n'est pas respecté." -ForegroundColor Red
+
+        foreach ($Blocker in $OSBlockers) {
+            Write-Host ("- {0}" -f $Blocker) -ForegroundColor Red
+        }
+
+        if ($HardwareNotCapable) {
+            Write-Host "- Le contrôle Microsoft HardwareReadiness retourne NOT CAPABLE." -ForegroundColor Red
+        }
+
+        if ($GraphicsBlocking) {
+            Write-Host "- Le contrôle DirectX / WDDM est bloquant sur cette machine physique." -ForegroundColor Red
+        }
+
+        if ($HardwareUndetermined) {
+            Write-Host "Le contrôle matériel Microsoft n'a par ailleurs pas pu être déterminé complètement." -ForegroundColor Yellow
+        }
+
+        $ExitCode = 1
+    }
     elseif ($HardwareUndetermined) {
         $FinalResult = "UNDETERMINED"
 
@@ -801,15 +945,6 @@ try {
         Write-Host "Le contrôle matériel Microsoft n'a pas pu être validé." -ForegroundColor Yellow
 
         $ExitCode = 2
-    }
-    elseif ($PermanentBlock) {
-        $FinalResult = "NOT_CAPABLE"
-
-        Write-Host ""
-        Write-Host ("UPGRADE WINDOWS 11 {0} : NOT CAPABLE" -f $TargetVersion) -ForegroundColor Red
-        Write-Host "Au moins un prérequis obligatoire n'est pas respecté." -ForegroundColor Red
-
-        $ExitCode = 1
     }
     elseif ($Safeguard.Hold -or $PolicyBlock) {
         $FinalResult = "CAPABLE_BUT_BLOCKED"
