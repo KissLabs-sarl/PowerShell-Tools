@@ -15,7 +15,7 @@
       - Espace disque libre
       - Redémarrage en attente
       - Service Windows Update
-      - GPO TargetReleaseVersion / ProductVersion
+      - Verrouillage de version GPO / Intune (TargetReleaseVersion / ProductVersion)
       - WSUS
       - Safeguard Hold Microsoft (Appraiser, clé GE25H2)
       - Nettoyage automatique du dossier temporaire
@@ -63,7 +63,7 @@
       1 = NOT_CAPABLE
       2 = UNDETERMINED / ALREADY_CURRENT_CHECK_INCOMPLETE / ERROR
           (y compris exécution sans droits administrateur)
-      3 = CAPABLE_BUT_BLOCKED (GPO / Safeguard Hold / édition LTSC)
+      3 = CAPABLE_BUT_BLOCKED (stratégie GPO / Intune, Safeguard Hold, édition LTSC)
       4 = ALREADY_CURRENT_NOT_COMPLIANT
 #>
 
@@ -91,6 +91,7 @@ $KnownHardwareScriptHashes = @(
 )
 $ExitCode = 2
 $FinalResult = "UNDETERMINED"
+$TranscriptStarted = $false
 
 function Write-Title {
     param([string]$Text)
@@ -471,6 +472,9 @@ foreach ($PathParameter in @("HardwareScriptPath", "LogDirectory")) {
 # introuvables et les contrôles concluraient à tort que tout va bien.
 $Is32BitHostOn64BitOS = [Environment]::Is64BitOperatingSystem -and (-not [Environment]::Is64BitProcess)
 
+# Avertissements affichés une fois le journal ouvert, pour y figurer aussi.
+$HostWarnings = New-Object System.Collections.Generic.List[string]
+
 if ($Is32BitHostOn64BitOS) {
     $SysNativePowerShell = Join-Path $env:SystemRoot "SysNative\WindowsPowerShell\v1.0\powershell.exe"
 
@@ -492,7 +496,9 @@ if ($Is32BitHostOn64BitOS) {
         }
 
         if (-not [string]::IsNullOrWhiteSpace($LogDirectory)) {
-            $RelaunchArguments += @("-LogDirectory", $LogDirectory)
+            # Windows PowerShell 5.1 n'échappe pas un "\" final dans un argument
+            # entre guillemets : le retirer (sauf racine de lecteur).
+            $RelaunchArguments += @("-LogDirectory", ($LogDirectory -replace '(?<=[^\\:])\\+$', ''))
         }
 
         Write-Host "[INFO] Hôte PowerShell 32 bits détecté : relance en PowerShell 64 bits." -ForegroundColor Cyan
@@ -508,7 +514,7 @@ if ($Is32BitHostOn64BitOS) {
             $RelaunchCompleted = $true
         }
         catch {
-            Write-Host ("[WARN] Relance 64 bits impossible : {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+            $HostWarnings.Add(("Relance 64 bits impossible : {0}" -f $_.Exception.Message))
         }
         finally {
             # Le marqueur ne vaut que pour le processus relancé : une nouvelle
@@ -527,32 +533,7 @@ if ($Is32BitHostOn64BitOS) {
         $ErrorActionPreference = "Stop"
     }
 
-    Write-Host "[WARN] Hôte PowerShell 32 bits : certains contrôles du registre peuvent être incomplets." -ForegroundColor Yellow
-}
-
-# ----------------------------------------------------------------------------
-# Journal (fichier dédié, une exécution par fichier)
-# ----------------------------------------------------------------------------
-
-$TranscriptStarted = $false
-$LogFile = $null
-
-try {
-    if ([string]::IsNullOrWhiteSpace($LogDirectory)) {
-        $LogDirectory = Join-Path $env:ProgramData "KissLabs\Logs"
-    }
-
-    if (-not (Test-Path -LiteralPath $LogDirectory -PathType Container)) {
-        New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
-    }
-
-    $LogFile = Join-Path $LogDirectory ("Check-Windows11Upgrade_{0}_{1}_{2}.log" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd-HHmmss"), $PID)
-    Start-Transcript -LiteralPath $LogFile -Force | Out-Null
-    $TranscriptStarted = $true
-}
-catch {
-    $LogFile = $null
-    Write-Host ("[WARN] Journal impossible à créer : {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+    $HostWarnings.Add("Hôte 32 bits : certains contrôles du registre peuvent être incomplets.")
 }
 
 # ----------------------------------------------------------------------------
@@ -567,6 +548,44 @@ if (-not $IsAdministrator) {
     Write-Host ""
     Write-Check "Droits" "ERROR" "Le script doit être exécuté en administrateur."
     Exit-Script -Result "ERROR" -Code 2
+}
+
+# ----------------------------------------------------------------------------
+# Journal (fichier dédié, une exécution par fichier)
+# ----------------------------------------------------------------------------
+
+$LogFile = $null
+
+try {
+    if ([string]::IsNullOrWhiteSpace($LogDirectory)) {
+        $LogDirectory = Join-Path $env:ProgramData "KissLabs\Logs"
+    }
+
+    if (-not (Test-Path -LiteralPath $LogDirectory -PathType Container)) {
+        New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    # Le journal est écrit en administrateur / SYSTEM : refuser un dossier
+    # (ou son parent) redirigé par une jonction ou un lien symbolique.
+    foreach ($LogPathToCheck in @($LogDirectory, (Split-Path -Path $LogDirectory -Parent))) {
+        if ([string]::IsNullOrWhiteSpace($LogPathToCheck)) {
+            continue
+        }
+
+        $LogPathItem = Get-Item -LiteralPath $LogPathToCheck -Force -ErrorAction SilentlyContinue
+
+        if (($null -ne $LogPathItem) -and ($LogPathItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw ("dossier redirigé (jonction / lien symbolique) : {0}" -f $LogPathToCheck)
+        }
+    }
+
+    $LogFile = Join-Path $LogDirectory ("Check-Windows11Upgrade_{0}_{1}_{2}.log" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd-HHmmss"), $PID)
+    Start-Transcript -LiteralPath $LogFile -Force | Out-Null
+    $TranscriptStarted = $true
+}
+catch {
+    $LogFile = $null
+    $HostWarnings.Add(("Journal impossible à créer : {0}" -f $_.Exception.Message))
 }
 
 # ----------------------------------------------------------------------------
@@ -585,6 +604,10 @@ try {
 
     if ($null -ne $LogFile) {
         Write-Check "Journal" "INFO" $LogFile
+    }
+
+    foreach ($HostWarning in $HostWarnings) {
+        Write-Check "Avertissement" "WARN" $HostWarning
     }
 
     try {

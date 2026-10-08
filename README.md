@@ -25,7 +25,8 @@ de code de sortie exploitable.
    [`HardwareReadiness.ps1`](https://aka.ms/HWReadinessScript).
 3. **DirectX 12 / WDDM 2.0** via `dxdiag` (simple avertissement sur une machine virtuelle).
 4. **État Windows** : redémarrage en attente, service Windows Update, verrouillage de version
-   `TargetReleaseVersion` / `ProductVersion` par GPO ou par Intune (MDM), WSUS.
+   `TargetReleaseVersion` / `ProductVersion` par GPO ou par Intune (MDM), WSUS. Sous Windows 10, un
+   verrouillage sans `ProductVersion` = Windows 11 est considéré comme bloquant.
 5. **Safeguard Hold** Microsoft (blocage de compatibilité posé par Microsoft sur la machine), lu dans
    les données de l'évaluation de compatibilité Windows (Appraiser) pour la version cible (clé `GE25H2`),
    en tenant compte de la stratégie `DisableWUfBSafeguards`.
@@ -72,7 +73,7 @@ L'aide complète est disponible avec `Get-Help .\Check-Windows11Upgrade.ps1 -Ful
 | `2` | `UNDETERMINED` | Le contrôle matériel Microsoft n'a pas pu conclure. |
 | `2` | `ALREADY_CURRENT_CHECK_INCOMPLETE` | Déjà à jour, mais le contrôle matériel n'a pas pu conclure. |
 | `2` | `ERROR` | Erreur d'exécution (pas de droits administrateur, téléchargement impossible, signature invalide…). |
-| `3` | `CAPABLE_BUT_BLOCKED` | Matériel compatible, mais une GPO, un Safeguard Hold ou une édition LTSC bloque la mise à niveau. |
+| `3` | `CAPABLE_BUT_BLOCKED` | Matériel compatible, mais une stratégie GPO ou Intune (`TargetReleaseVersion` / `ProductVersion`), un Safeguard Hold ou une édition LTSC bloque la mise à niveau. |
 | `4` | `ALREADY_CURRENT_NOT_COMPLIANT` | Déjà à jour, mais le matériel ne respecte pas tous les prérequis. |
 
 Les deux dernières lignes de la sortie (`FinalResult` et `ExitCode`) résument le résultat, y compris en
@@ -84,7 +85,8 @@ Chaque exécution écrit un fichier dédié
 `Check-Windows11Upgrade_<POSTE>_<AAAAMMJJ-HHMMSS>_<PID>.log` dans `%ProgramData%\KissLabs\Logs` (ou
 `-LogDirectory`). Chaque ligne de contrôle est horodatée et porte un niveau (`INFO`, `OK`, `WARN`, `FAIL`,
 `ERROR`). Si le journal ne peut pas être créé, un avertissement est affiché et le contrôle continue.
-Les fichiers ne sont pas purgés automatiquement.
+Le journal n'est ouvert qu'après la vérification des droits administrateur, et un dossier redirigé
+(jonction ou lien symbolique) est refusé. Les fichiers ne sont pas purgés automatiquement.
 
 ### Notes de déploiement
 
