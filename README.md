@@ -16,15 +16,16 @@ de code de sortie exploitable.
 
 ### Contrôles effectués
 
-1. **Système d'exploitation** : édition client (pas Windows Server), version source compatible
+1. **Système d'exploitation** : édition client (pas Windows Server ; Windows Enterprise multi-session
+   / AVD est traité comme un poste client), version source compatible
    (Windows 10 2004 ou plus récent avec la mise à jour du 14 septembre 2021), version déjà installée
    (25H2 ou plus récent, comparaison sur le numéro de build), édition LTSC, détection machine virtuelle,
    espace disque libre.
 2. **Prérequis matériels Microsoft** (CPU, RAM, TPM 2.0, Secure Boot, stockage) via le script officiel
    [`HardwareReadiness.ps1`](https://aka.ms/HWReadinessScript).
 3. **DirectX 12 / WDDM 2.0** via `dxdiag` (simple avertissement sur une machine virtuelle).
-4. **État Windows** : redémarrage en attente, service Windows Update, GPO `TargetReleaseVersion` /
-   `ProductVersion`, WSUS.
+4. **État Windows** : redémarrage en attente, service Windows Update, verrouillage de version
+   `TargetReleaseVersion` / `ProductVersion` par GPO ou par Intune (MDM), WSUS.
 5. **Safeguard Hold** Microsoft (blocage de compatibilité posé par Microsoft sur la machine), lu dans
    les données de l'évaluation de compatibilité Windows (Appraiser) pour la version cible (clé `GE25H2`),
    en tenant compte de la stratégie `DisableWUfBSafeguards`.
@@ -47,6 +48,9 @@ de code de sortie exploitable.
 
 # Conserver les fichiers temporaires (HardwareReadiness.ps1, DxDiag.xml) pour analyse
 .\Check-Windows11Upgrade.ps1 -KeepTemp
+
+# Journal dans un autre dossier
+.\Check-Windows11Upgrade.ps1 -LogDirectory "D:\Logs"
 ```
 
 | Paramètre | Défaut | Description |
@@ -54,6 +58,7 @@ de code de sortie exploitable.
 | `-RecommendedFreeSpaceGB` | `30` | Espace libre recommandé sur le disque système (avertissement non bloquant). |
 | `-KeepTemp` | — | Conserve le dossier temporaire au lieu de le supprimer. |
 | `-HardwareScriptPath` | — | Copie locale de `HardwareReadiness.ps1` à utiliser au lieu du téléchargement. |
+| `-LogDirectory` | `%ProgramData%\KissLabs\Logs` | Dossier du fichier journal. |
 
 L'aide complète est disponible avec `Get-Help .\Check-Windows11Upgrade.ps1 -Full`.
 
@@ -70,7 +75,16 @@ L'aide complète est disponible avec `Get-Help .\Check-Windows11Upgrade.ps1 -Ful
 | `3` | `CAPABLE_BUT_BLOCKED` | Matériel compatible, mais une GPO, un Safeguard Hold ou une édition LTSC bloque la mise à niveau. |
 | `4` | `ALREADY_CURRENT_NOT_COMPLIANT` | Déjà à jour, mais le matériel ne respecte pas tous les prérequis. |
 
-Les deux dernières lignes de la sortie (`FinalResult` et `ExitCode`) résument le résultat.
+Les deux dernières lignes de la sortie (`FinalResult` et `ExitCode`) résument le résultat, y compris en
+cas d'`ERROR`.
+
+### Journal
+
+Chaque exécution écrit un fichier dédié
+`Check-Windows11Upgrade_<POSTE>_<AAAAMMJJ-HHMMSS>_<PID>.log` dans `%ProgramData%\KissLabs\Logs` (ou
+`-LogDirectory`). Chaque ligne de contrôle est horodatée et porte un niveau (`INFO`, `OK`, `WARN`, `FAIL`,
+`ERROR`). Si le journal ne peut pas être créé, un avertissement est affiché et le contrôle continue.
+Les fichiers ne sont pas purgés automatiquement.
 
 ### Notes de déploiement
 

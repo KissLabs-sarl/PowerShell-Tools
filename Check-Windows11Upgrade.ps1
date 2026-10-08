@@ -28,6 +28,9 @@
     par défaut), le script se relance automatiquement en PowerShell 64 bits
     afin de lire les bonnes clés de registre.
 
+    Chaque exécution est journalisée (horodatage, niveau) dans un fichier
+    dédié, par défaut %ProgramData%\KissLabs\Logs.
+
 .PARAMETER RecommendedFreeSpaceGB
     Espace libre recommandé sur le disque système, en Go. En dessous, un
     avertissement est affiché (non bloquant). Défaut : 30.
@@ -40,6 +43,9 @@
     Chemin d'une copie locale de HardwareReadiness.ps1, pour les machines sans
     accès Internet. Si absent, le script est téléchargé depuis
     https://aka.ms/HWReadinessScript. La signature est contrôlée dans les deux cas.
+
+.PARAMETER LogDirectory
+    Dossier du fichier journal. Défaut : %ProgramData%\KissLabs\Logs.
 
 .EXAMPLE
     .\Check-Windows11Upgrade.ps1
@@ -65,7 +71,8 @@
 param(
     [int]$RecommendedFreeSpaceGB = 30,
     [switch]$KeepTemp,
-    [string]$HardwareScriptPath
+    [string]$HardwareScriptPath,
+    [string]$LogDirectory
 )
 
 $ErrorActionPreference = "Stop"
@@ -97,7 +104,7 @@ function Write-Title {
 function Write-Check {
     param(
         [string]$Name,
-        [ValidateSet("OK", "WARN", "FAIL", "INFO")]
+        [ValidateSet("OK", "WARN", "FAIL", "INFO", "ERROR")]
         [string]$State,
         [string]$Detail
     )
@@ -106,11 +113,35 @@ function Write-Check {
         "OK"   { "Green" }
         "WARN" { "Yellow" }
         "FAIL" { "Red" }
+        "ERROR" { "Red" }
         "INFO" { "Cyan" }
         default { "White" }
     }
 
-    Write-Host ("[{0,-4}] {1,-28} {2}" -f $State, $Name, $Detail) -ForegroundColor $Color
+    Write-Host ("{0} [{1,-5}] {2,-28} {3}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $State, $Name, $Detail) -ForegroundColor $Color
+}
+
+function Exit-Script {
+    param(
+        [string]$Result,
+        [int]$Code
+    )
+
+    # Résumé toujours en dernières lignes de la sortie et du journal.
+    Write-Host ""
+    Write-Host ("FinalResult : {0}" -f $Result)
+    Write-Host ("ExitCode    : {0}" -f $Code)
+
+    if ($script:TranscriptStarted) {
+        try {
+            Stop-Transcript | Out-Null
+        }
+        catch {
+            Write-Verbose ("Arrêt du journal impossible : {0}" -f $_.Exception.Message)
+        }
+    }
+
+    exit $Code
 }
 
 function Get-PropertyValue {
@@ -198,6 +229,7 @@ function Test-PendingReboot {
         }
     }
     catch {
+        Write-Verbose ("PendingFileRenameOperations illisible : {0}" -f $_.Exception.Message)
     }
 
     [PSCustomObject]@{
@@ -418,14 +450,25 @@ function Get-SafeguardStatus {
 # Relance en PowerShell 64 bits
 # ----------------------------------------------------------------------------
 
+# Chemins absolus : le processus relancé ne partage pas l'emplacement
+# PowerShell courant. Un lecteur absent (session SYSTEM, élévation UAC) laisse
+# la valeur telle quelle : les contrôles suivants renverront ERROR (2).
+foreach ($PathParameter in @("HardwareScriptPath", "LogDirectory")) {
+    $PathValue = Get-Variable -Name $PathParameter -ValueOnly
+
+    if (-not [string]::IsNullOrWhiteSpace($PathValue)) {
+        try {
+            Set-Variable -Name $PathParameter -Value $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($PathValue)
+        }
+        catch {
+            Write-Verbose ("Chemin non résolu ({0}) : {1}" -f $PathParameter, $_.Exception.Message)
+        }
+    }
+}
+
 # Un hôte 32 bits (Intune par défaut, certains RMM) voit le registre via
 # WOW6432Node : les clés Appraiser / Component Based Servicing seraient
 # introuvables et les contrôles concluraient à tort que tout va bien.
-if (-not [string]::IsNullOrWhiteSpace($HardwareScriptPath)) {
-    # Chemin absolu : le processus relancé ne partage pas l'emplacement PowerShell courant.
-    $HardwareScriptPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($HardwareScriptPath)
-}
-
 $Is32BitHostOn64BitOS = [Environment]::Is64BitOperatingSystem -and (-not [Environment]::Is64BitProcess)
 
 if ($Is32BitHostOn64BitOS) {
@@ -448,29 +491,68 @@ if ($Is32BitHostOn64BitOS) {
             $RelaunchArguments += @("-HardwareScriptPath", $HardwareScriptPath)
         }
 
+        if (-not [string]::IsNullOrWhiteSpace($LogDirectory)) {
+            $RelaunchArguments += @("-LogDirectory", $LogDirectory)
+        }
+
         Write-Host "[INFO] Hôte PowerShell 32 bits détecté : relance en PowerShell 64 bits." -ForegroundColor Cyan
 
         # La sortie d'erreur du processus enfant ne doit pas interrompre le relais.
         $ErrorActionPreference = "Continue"
         $env:KISSLABS_W11CHECK_RELAUNCHED = "1"
+        $RelaunchCompleted = $false
 
         try {
             & $SysNativePowerShell @RelaunchArguments
-
-            if ($null -eq $LASTEXITCODE) {
-                exit 2
-            }
-
-            exit $LASTEXITCODE
+            $RelaunchExitCode = $LASTEXITCODE
+            $RelaunchCompleted = $true
         }
         catch {
             Write-Host ("[WARN] Relance 64 bits impossible : {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+        }
+        finally {
+            # Le marqueur ne vaut que pour le processus relancé : une nouvelle
+            # exécution dans le même hôte 32 bits doit pouvoir relancer.
+            Remove-Item -Path "Env:\KISSLABS_W11CHECK_RELAUNCHED" -ErrorAction SilentlyContinue
+        }
+
+        if ($RelaunchCompleted) {
+            if ($null -eq $RelaunchExitCode) {
+                exit 2
+            }
+
+            exit $RelaunchExitCode
         }
 
         $ErrorActionPreference = "Stop"
     }
 
     Write-Host "[WARN] Hôte PowerShell 32 bits : certains contrôles du registre peuvent être incomplets." -ForegroundColor Yellow
+}
+
+# ----------------------------------------------------------------------------
+# Journal (fichier dédié, une exécution par fichier)
+# ----------------------------------------------------------------------------
+
+$TranscriptStarted = $false
+$LogFile = $null
+
+try {
+    if ([string]::IsNullOrWhiteSpace($LogDirectory)) {
+        $LogDirectory = Join-Path $env:ProgramData "KissLabs\Logs"
+    }
+
+    if (-not (Test-Path -LiteralPath $LogDirectory -PathType Container)) {
+        New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    $LogFile = Join-Path $LogDirectory ("Check-Windows11Upgrade_{0}_{1}_{2}.log" -f $env:COMPUTERNAME, (Get-Date -Format "yyyyMMdd-HHmmss"), $PID)
+    Start-Transcript -LiteralPath $LogFile -Force | Out-Null
+    $TranscriptStarted = $true
+}
+catch {
+    $LogFile = $null
+    Write-Host ("[WARN] Journal impossible à créer : {0}" -f $_.Exception.Message) -ForegroundColor Yellow
 }
 
 # ----------------------------------------------------------------------------
@@ -483,8 +565,8 @@ $IsAdministrator = $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::
 
 if (-not $IsAdministrator) {
     Write-Host ""
-    Write-Host "[FAIL] Le script doit être exécuté en administrateur." -ForegroundColor Red
-    exit 2
+    Write-Check "Droits" "ERROR" "Le script doit être exécuté en administrateur."
+    Exit-Script -Result "ERROR" -Code 2
 }
 
 # ----------------------------------------------------------------------------
@@ -501,10 +583,15 @@ try {
     Write-Check "Machine" "INFO" $env:COMPUTERNAME
     Write-Check "Utilisateur" "INFO" $Identity.Name
 
+    if ($null -ne $LogFile) {
+        Write-Check "Journal" "INFO" $LogFile
+    }
+
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     }
     catch {
+        Write-Verbose ("Activation TLS 1.2 impossible : {0}" -f $_.Exception.Message)
     }
 
     New-Item -Path $TempFolder -ItemType Directory -Force | Out-Null
@@ -525,7 +612,9 @@ try {
     $Build = [int](Get-PropertyValue $CurrentVersion "CurrentBuildNumber" 0)
     $UBR = [int](Get-PropertyValue $CurrentVersion "UBR" 0)
     $FullBuild = "{0}.{1}" -f $Build, $UBR
-    $IsClientOS = ($OS.ProductType -eq 1)
+    # Windows Enterprise multi-session (AVD, EditionID ServerRdsh) est une
+    # édition client qui annonce pourtant ProductType 3, comme un serveur.
+    $IsClientOS = ($OS.ProductType -eq 1) -or ($EditionID -eq "ServerRdsh")
     $IsWindows11 = $IsClientOS -and ($Build -ge 22000)
 
     # Le registre peut encore exposer "Windows 10" sur certaines installations
@@ -729,6 +818,7 @@ try {
                 break
             }
             catch {
+                Write-Verbose ("Ligne non JSON ignorée : {0}" -f $Line)
             }
         }
     }
@@ -900,47 +990,72 @@ try {
     # ------------------------------------------------------------------------
 
     $PolicyBlock = $false
-    $WUPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
-    $WUPolicy = Get-ItemProperty $WUPolicyPath -ErrorAction SilentlyContinue
+    $WUPolicy = Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -ErrorAction SilentlyContinue
+    $MdmUpdatePolicy = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update" -ErrorAction SilentlyContinue
 
-    if ($null -ne $WUPolicy) {
-        $TargetReleaseEnabled = Get-PropertyValue $WUPolicy "TargetReleaseVersion" 0
-        $TargetReleaseInfo = [string](Get-PropertyValue $WUPolicy "TargetReleaseVersionInfo" "")
-        $TargetProduct = [string](Get-PropertyValue $WUPolicy "ProductVersion" "")
+    # Verrouillage de version : GPO (TargetReleaseVersion = 1) ou Intune / MDM
+    # (TargetReleaseVersion non vide, sans indicateur d'activation séparé).
+    $ReleasePins = @()
 
-        if ([int]$TargetReleaseEnabled -eq 1) {
-            if (-not [string]::IsNullOrWhiteSpace($TargetReleaseInfo)) {
-                $PolicyRelease = ConvertTo-ReleaseNumber $TargetReleaseInfo
-                $ExpectedRelease = ConvertTo-ReleaseNumber $TargetVersion
+    if ((ConvertTo-NullableInt (Get-PropertyValue $WUPolicy "TargetReleaseVersion")) -eq 1) {
+        $ReleasePins += [PSCustomObject]@{
+            Source  = "GPO"
+            Release = ([string](Get-PropertyValue $WUPolicy "TargetReleaseVersionInfo" "")).Trim()
+            Product = ([string](Get-PropertyValue $WUPolicy "ProductVersion" "")).Trim()
+        }
+    }
 
-                if ($TargetReleaseInfo.Trim() -eq $TargetVersion) {
-                    Write-Check "TargetReleaseVersion" "OK" ("GPO autorise {0}." -f $TargetVersion)
-                }
-                elseif (($null -ne $PolicyRelease) -and ($null -ne $ExpectedRelease) -and ($PolicyRelease -gt $ExpectedRelease)) {
-                    Write-Check "TargetReleaseVersion" "INFO" ("GPO cible {0}, plus récent que {1}." -f $TargetReleaseInfo, $TargetVersion)
-                }
-                else {
-                    $PolicyBlock = $true
-                    Write-Check "TargetReleaseVersion" "WARN" ("GPO verrouillée sur {0} ; cible attendue {1}." -f $TargetReleaseInfo, $TargetVersion)
-                }
+    $MdmRelease = ([string](Get-PropertyValue $MdmUpdatePolicy "TargetReleaseVersion" "")).Trim()
+
+    if (-not [string]::IsNullOrWhiteSpace($MdmRelease)) {
+        $ReleasePins += [PSCustomObject]@{
+            Source  = "MDM"
+            Release = $MdmRelease
+            Product = ([string](Get-PropertyValue $MdmUpdatePolicy "ProductVersion" "")).Trim()
+        }
+    }
+
+    foreach ($Pin in $ReleasePins) {
+        $PinName = "TargetRelease {0}" -f $Pin.Source
+
+        if (-not [string]::IsNullOrWhiteSpace($Pin.Release)) {
+            $PolicyRelease = ConvertTo-ReleaseNumber $Pin.Release
+            $ExpectedRelease = ConvertTo-ReleaseNumber $TargetVersion
+
+            if ($Pin.Release -eq $TargetVersion) {
+                Write-Check $PinName "OK" ("Stratégie autorise {0}." -f $TargetVersion)
             }
-
-            if (($TargetProduct -eq "Windows 10") -and (-not $IsWindows11)) {
+            elseif (($null -ne $PolicyRelease) -and ($null -ne $ExpectedRelease) -and ($PolicyRelease -gt $ExpectedRelease)) {
+                Write-Check $PinName "INFO" ("Stratégie cible {0}, plus récent que {1}." -f $Pin.Release, $TargetVersion)
+            }
+            else {
                 $PolicyBlock = $true
-                Write-Check "ProductVersion GPO" "WARN" "La GPO maintient explicitement la machine sur Windows 10."
+                Write-Check $PinName "WARN" ("Stratégie verrouillée sur {0} ; cible attendue {1}." -f $Pin.Release, $TargetVersion)
             }
         }
 
-        $FeatureDeferral = Get-PropertyValue $WUPolicy "DeferFeatureUpdatesPeriodInDays"
+        # Sans ProductVersion = Windows 11, Windows Update reste sur le produit
+        # installé : une machine Windows 10 n'est jamais mise à niveau.
+        if ((-not $IsWindows11) -and ($Pin.Product -notmatch '^(Windows\s*)?11$')) {
+            $PolicyBlock = $true
 
-        if ($null -ne $FeatureDeferral) {
-            Write-Check "Feature Update Deferral" "INFO" ("{0} jour(s)" -f $FeatureDeferral)
+            if ([string]::IsNullOrWhiteSpace($Pin.Product)) {
+                Write-Check ("ProductVersion {0}" -f $Pin.Source) "WARN" "Non définie : la stratégie maintient la machine sur Windows 10."
+            }
+            else {
+                Write-Check ("ProductVersion {0}" -f $Pin.Source) "WARN" ("{0} : la stratégie maintient la machine sur Windows 10." -f $Pin.Product)
+            }
         }
+    }
+
+    $FeatureDeferral = Get-PropertyValue $WUPolicy "DeferFeatureUpdatesPeriodInDays"
+
+    if ($null -ne $FeatureDeferral) {
+        Write-Check "Feature Update Deferral" "INFO" ("{0} jour(s)" -f $FeatureDeferral)
     }
 
     # Contournement des safeguard holds par stratégie (GPO ou MDM / Intune).
     $SafeguardsBypassed = ([string](Get-PropertyValue $WUPolicy "DisableWUfBSafeguards" "")).Trim() -eq "1"
-    $MdmUpdatePolicy = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update" -ErrorAction SilentlyContinue
 
     if (([string](Get-PropertyValue $MdmUpdatePolicy "DisableWUfBSafeguards" "")).Trim() -eq "1") {
         $SafeguardsBypassed = $true
@@ -952,9 +1067,9 @@ try {
 
     $AUPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
     $AUPolicy = Get-ItemProperty $AUPath -ErrorAction SilentlyContinue
-    $UseWUServer = Get-PropertyValue $AUPolicy "UseWUServer" 0
+    $UseWUServer = ConvertTo-NullableInt (Get-PropertyValue $AUPolicy "UseWUServer")
 
-    if ([int]$UseWUServer -eq 1) {
+    if ($UseWUServer -eq 1) {
         $WUServer = [string](Get-PropertyValue $WUPolicy "WUServer" "WSUS configuré")
         Write-Check "WSUS" "INFO" ("Machine gérée par WSUS : {0}" -f $WUServer)
     }
@@ -1140,7 +1255,7 @@ try {
         }
 
         if ($PolicyBlock) {
-            Write-Host "- GPO Windows Update (TargetReleaseVersion / ProductVersion)." -ForegroundColor Yellow
+            Write-Host "- Stratégie Windows Update GPO / Intune (TargetReleaseVersion / ProductVersion)." -ForegroundColor Yellow
         }
 
         if ($EditionBlock) {
@@ -1167,10 +1282,6 @@ try {
 
         $ExitCode = 0
     }
-
-    Write-Host ""
-    Write-Host ("FinalResult : {0}" -f $FinalResult)
-    Write-Host ("ExitCode    : {0}" -f $ExitCode)
 }
 catch {
     $FinalResult = "ERROR"
@@ -1181,7 +1292,7 @@ catch {
     Write-Host " ERREUR WINDOWS 11 UPGRADE CHECK" -ForegroundColor Red
     Write-Host "============================================================" -ForegroundColor Red
     Write-Host ""
-    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Check "Erreur" "ERROR" $_.Exception.Message
 }
 finally {
     Write-Host ""
@@ -1202,4 +1313,4 @@ finally {
     }
 }
 
-exit $ExitCode
+Exit-Script -Result $FinalResult -Code $ExitCode
