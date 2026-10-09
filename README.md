@@ -1,6 +1,6 @@
-# PowerShell Tools
+# Public PowerShell Tools
 
-[![PowerShell quality](https://github.com/KissLabs-sarl/PowerShell-Tools/actions/workflows/powershell-quality.yml/badge.svg)](https://github.com/KissLabs-sarl/PowerShell-Tools/actions/workflows/powershell-quality.yml)
+[![PowerShell quality](https://github.com/KissLabs-sarl/Public-PowerShell-Tools/actions/workflows/powershell-quality.yml/badge.svg)](https://github.com/KissLabs-sarl/Public-PowerShell-Tools/actions/workflows/powershell-quality.yml)
 
 Scripts PowerShell d'administration Windows, par KissLabs.
 
@@ -42,6 +42,14 @@ de code de sortie exploitable.
 - Exécution **en administrateur** (ou en SYSTEM).
 - Accès HTTPS à `aka.ms` / `download.microsoft.com`, sauf si une copie locale de `HardwareReadiness.ps1`
   est fournie avec `-HardwareScriptPath`.
+
+### Téléchargement direct (RMM)
+
+```text
+https://raw.githubusercontent.com/KissLabs-sarl/Public-PowerShell-Tools/main/Check-Windows11Upgrade.ps1
+```
+
+Pour figer une version en production, remplacer `main` par le tag de la release (par exemple `v1.2.0`).
 
 ### Utilisation
 
