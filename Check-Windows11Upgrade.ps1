@@ -29,7 +29,8 @@
     afin de lire les bonnes clés de registre.
 
     Chaque exécution est journalisée (horodatage, niveau) dans un fichier
-    dédié, par défaut %ProgramData%\KissLabs\Logs.
+    dédié, par défaut %SystemRoot%\Logs\KissLabs (écriture réservée à SYSTEM
+    et aux administrateurs).
 
 .PARAMETER RecommendedFreeSpaceGB
     Espace libre recommandé sur le disque système, en Go. En dessous, un
@@ -45,7 +46,7 @@
     https://aka.ms/HWReadinessScript. La signature est contrôlée dans les deux cas.
 
 .PARAMETER LogDirectory
-    Dossier du fichier journal. Défaut : %ProgramData%\KissLabs\Logs.
+    Dossier du fichier journal. Défaut : %SystemRoot%\Logs\KissLabs.
 
 .EXAMPLE
     .\Check-Windows11Upgrade.ps1
@@ -557,8 +558,10 @@ if (-not $IsAdministrator) {
 $LogFile = $null
 
 try {
+    # Défaut sous %SystemRoot%\Logs : un utilisateur standard ne peut pas y
+    # créer de dossier à l'avance (contrairement à %ProgramData%).
     if ([string]::IsNullOrWhiteSpace($LogDirectory)) {
-        $LogDirectory = Join-Path $env:ProgramData "KissLabs\Logs"
+        $LogDirectory = Join-Path $env:SystemRoot "Logs\KissLabs"
     }
 
     if (-not (Test-Path -LiteralPath $LogDirectory -PathType Container)) {

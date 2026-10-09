@@ -1,6 +1,11 @@
 # PowerShell Tools
 
+[![PowerShell quality](https://github.com/KissLabs-sarl/PowerShell-Tools/actions/workflows/powershell-quality.yml/badge.svg)](https://github.com/KissLabs-sarl/PowerShell-Tools/actions/workflows/powershell-quality.yml)
+
 Scripts PowerShell d'administration Windows, par KissLabs.
+
+Chaque push et pull request est contrôlé automatiquement : syntaxe, PSScriptAnalyzer, compatibilité
+Windows PowerShell 5.1 et validité de l'aide intégrée (`.github/workflows/powershell-quality.yml`).
 
 | Script | Rôle |
 | --- | --- |
@@ -59,7 +64,7 @@ de code de sortie exploitable.
 | `-RecommendedFreeSpaceGB` | `30` | Espace libre recommandé sur le disque système (avertissement non bloquant). |
 | `-KeepTemp` | — | Conserve le dossier temporaire au lieu de le supprimer. |
 | `-HardwareScriptPath` | — | Copie locale de `HardwareReadiness.ps1` à utiliser au lieu du téléchargement. |
-| `-LogDirectory` | `%ProgramData%\KissLabs\Logs` | Dossier du fichier journal. |
+| `-LogDirectory` | `%SystemRoot%\Logs\KissLabs` | Dossier du fichier journal. |
 
 L'aide complète est disponible avec `Get-Help .\Check-Windows11Upgrade.ps1 -Full`.
 
@@ -81,12 +86,17 @@ cas d'`ERROR`.
 
 ### Journal
 
-Chaque exécution écrit un fichier dédié
-`Check-Windows11Upgrade_<POSTE>_<AAAAMMJJ-HHMMSS>_<PID>.log` dans `%ProgramData%\KissLabs\Logs` (ou
-`-LogDirectory`). Chaque ligne de contrôle est horodatée et porte un niveau (`INFO`, `OK`, `WARN`, `FAIL`,
-`ERROR`). Si le journal ne peut pas être créé, un avertissement est affiché et le contrôle continue.
-Le journal n'est ouvert qu'après la vérification des droits administrateur, et un dossier redirigé
-(jonction ou lien symbolique) est refusé. Les fichiers ne sont pas purgés automatiquement.
+Chaque exécution écrit un fichier dédié `Check-Windows11Upgrade_<POSTE>_<AAAAMMJJ-HHMMSS>_<PID>.log`
+dans `%SystemRoot%\Logs\KissLabs` (`C:\Windows\Logs\KissLabs`), ou dans `-LogDirectory`.
+
+- Chaque ligne de contrôle est horodatée et porte un niveau (`INFO`, `OK`, `WARN`, `FAIL`, `ERROR`).
+- Seuls SYSTEM et les administrateurs peuvent écrire dans le dossier par défaut : un utilisateur
+  standard ne peut ni le pré-créer ni modifier les journaux.
+- Le journal n'est ouvert qu'après la vérification des droits administrateur ; un dossier redirigé
+  (jonction ou lien symbolique) est refusé.
+- Si le journal ne peut pas être créé, un avertissement est affiché et le contrôle continue (le
+  résultat et le code de sortie ne changent pas).
+- Les fichiers ne sont pas purgés automatiquement.
 
 ### Notes de déploiement
 
