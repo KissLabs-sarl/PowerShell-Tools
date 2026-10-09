@@ -1,0 +1,65 @@
+name: PowerShell quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyse des scripts PowerShell
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Installer PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.23.0 -Scope CurrentUser -Force
+
+      - name: Analyser les scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Compatibility = @{ Rules = @{ PSUseCompatibleSyntax = @{ Enable = $true; TargetVersions = @('5.1') } } }
+          $Problems = 0
+
+          foreach ($File in Get-ChildItem -Path . -Filter '*.ps1' -Recurse -File) {
+              Write-Host ("[INFO] {0}" -f $File.FullName)
+
+              # Syntaxe
+              $ParseErrors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile($File.FullName, [ref]$null, [ref]$ParseErrors)
+              $Results = @($ParseErrors | ForEach-Object { "Syntaxe : $_" })
+
+              # Bonnes pratiques (Write-Host est voulu : sortie lisible en console / RMM)
+              $Results += @(Invoke-ScriptAnalyzer -Path $File.FullName -Severity Error, Warning -ExcludeRule PSAvoidUsingWriteHost |
+                  ForEach-Object { "Ligne {0} : {1} - {2}" -f $_.Line, $_.RuleName, $_.Message })
+
+              # Compatibilité Windows PowerShell 5.1
+              $Results += @(Invoke-ScriptAnalyzer -Path $File.FullName -Settings $Compatibility -IncludeRule PSUseCompatibleSyntax |
+                  ForEach-Object { "Ligne {0} : {1} - {2}" -f $_.Line, $_.RuleName, $_.Message })
+
+              # Bloc d'aide valide (un mot-clé inconnu le fait ignorer par Get-Help)
+              if ($null -eq (Get-Help -Name $File.FullName -Full).description) {
+                  $Results += "Aide : bloc d'aide absent ou invalide (Get-Help)."
+              }
+
+              foreach ($Result in $Results) {
+                  Write-Host ("::error title={0}::{1}" -f $File.Name, $Result)
+              }
+
+              $Problems += $Results.Count
+          }
+
+          if ($Problems -gt 0) {
+              throw ("{0} problème(s) détecté(s)." -f $Problems)
+          }
+
+          Write-Host "[INFO] Aucun problème détecté."
